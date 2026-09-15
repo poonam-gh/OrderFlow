@@ -1,6 +1,11 @@
 package order
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+var ErrNotFound = errors.New("order not found")
 
 type Order struct {
 	ID         string    `db:"id" json:"id"`

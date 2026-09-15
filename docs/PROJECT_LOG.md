@@ -856,6 +856,50 @@ statement.
 
 ---
 
+## 16. `GET /orders/:id`, and moving routing out of handlers
+
+**Adding fetch-by-id** followed the same layered pattern as create:
+- `domains/order/order.go` — added `var ErrNotFound = errors.New("order not found")`, a sentinel error the repository returns so callers can distinguish "doesn't exist" from "something broke," using `errors.Is` rather than string-matching an error message.
+- `contracts/order_repository.go` — added `GetByID(ctx, id string) (*order.Order, error)` to the interface.
+- `infra/postgres/order_repo.go` — `db.GetContext(ctx, &o, "SELECT * FROM orders WHERE id = $1", id)` (sqlx's struct-scanning doing its job — this is exactly why we switched to sqlx in section 10), translating `sql.ErrNoRows` into `order.ErrNotFound` right at the repository boundary, so nothing above this layer needs to know about `database/sql` error types.
+- `services/order_service.go` — `GetOrder` is a thin passthrough for now.
+- `handlers/order_handler.go` — `Get` checks `errors.Is(err, order.ErrNotFound)` → `404`, anything else → `500`.
+
+**Then a refactor: routing moved out of `handlers/` into `routers/`.**
+Originally `OrderHandler` had its own `Register(r *gin.Engine)` method,
+called directly from `dependencies/server_dependencies.go`. That mixes two
+different responsibilities in one type: *handling* a request (parsing
+input, calling the service, shaping the response) and *deciding the URL
+structure* (which path/method maps to which handler) — a violation of
+single responsibility, and it meant the previously-unused `routers/`
+folder (present since the original project skeleton, section 1) stayed
+pointless.
+
+Now:
+- **`handlers/order_handler.go`** only exposes `Create` and `Get` as plain
+  `gin.HandlerFunc`-compatible methods — it has no idea what path or HTTP
+  method it's mounted on.
+- **`routers/order_routes.go`** — `registerOrderRoutes(engine, h)` is the
+  only place that knows `POST /orders` and `GET /orders/:id` map to
+  `h.Create`/`h.Get`.
+- **`routers/router.go`** — `Register(engine, appCtx, orderHandler)` is the
+  single entry point called from `dependencies/server_dependencies.go`; it
+  registers `/healthz` directly (not domain-specific, stays here) and
+  delegates to `registerOrderRoutes` for anything order-related.
+
+Why split routes into a per-resource file (`order_routes.go`) rather than
+one growing `router.go`: adding Products/Users routes later means adding
+`product_routes.go`/`user_routes.go` and one line in `Register` — existing
+route files never need to change (open/closed). `dependencies/server_dependencies.go`
+now only builds the handler and hands it to `routers.Register` — it no
+longer touches `gin.Engine` route registration directly at all.
+
+Re-verified end-to-end after the refactor: create → 200/201, fetch by real
+id → 200 with the row, fetch by a nonexistent id → 404
+`{"error":"order not found"}`, `/healthz` → 200.
+
+---
+
 ## Status as of this writing
 
 Done: project skeleton, config loading, Postgres (via sqlx)/Redis
@@ -869,15 +913,18 @@ migrations are applied and verified directly in `psql`, and both
 `orderflow worker` (worker pool starts, 4 goroutines) have been run
 end-to-end successfully.
 
-One real endpoint now exists: `POST /orders` (section 15) — no validation,
-no outbox event, no worker involvement yet, just request → Postgres row →
-response. Verified working end-to-end including the audit trigger firing
-on real traffic.
+Two real endpoints now exist: `POST /orders` and `GET /orders/:id`
+(sections 15–16) — no validation, no outbox event, no worker involvement
+yet, just request → Postgres → response. Routing is now properly owned by
+`routers/` (per-resource route files, e.g. `order_routes.go`), separate
+from `handlers/`, which only handles requests. Verified end-to-end
+including the audit trigger firing on real traffic and a proper 404 on a
+missing order.
 
 Not yet done: Products/Users/Payments domains are still empty
-(`contracts/`, `domains/`, `handlers/` only have Order-related files so
-far; `routers/`, `views/` are still unused). No stock validation, no
-outbox event written on order creation yet, and the worker pool/delegator
-still have nothing registered — the worker process currently just idles.
-Next up: add validation + the outbox write to `CreateOrder`, then build the
+(`contracts/`, `domains/`, `handlers/`, `routers/` only have Order-related
+files so far; `views/` is still unused). No stock validation, no outbox
+event written on order creation yet, and the worker pool/delegator still
+have nothing registered — the worker process currently just idles. Next
+up: add validation + the outbox write to `CreateOrder`, then build the
 outbox dispatcher that actually gives the worker pool something to do.

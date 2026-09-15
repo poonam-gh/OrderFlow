@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 
+	"orderflow/domains/order"
 	"orderflow/services"
 )
 
@@ -37,6 +39,16 @@ func (h *OrderHandler) Create(c *gin.Context) {
 	c.JSON(http.StatusCreated, o)
 }
 
-func (h *OrderHandler) Register(r *gin.Engine) {
-	r.POST("/orders", h.Create)
+func (h *OrderHandler) Get(c *gin.Context) {
+	o, err := h.service.GetOrder(c.Request.Context(), c.Param("id"))
+	if errors.Is(err, order.ErrNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "order not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, o)
 }

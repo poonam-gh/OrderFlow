@@ -10,6 +10,7 @@ import (
 	"orderflow/app"
 	"orderflow/handlers"
 	"orderflow/infra/postgres"
+	"orderflow/routers"
 	"orderflow/services"
 )
 
@@ -22,22 +23,11 @@ type ServerDependencies struct {
 func NewServerDependencies(appCtx *app.AppContext) *ServerDependencies {
 	engine := gin.Default() // Logger + Recovery middleware included
 
-	engine.GET("/healthz", func(c *gin.Context) {
-		if err := appCtx.DB.PingContext(c.Request.Context()); err != nil {
-			c.String(http.StatusServiceUnavailable, "db unreachable")
-			return
-		}
-		if err := appCtx.Redis.Ping(c.Request.Context()).Err(); err != nil {
-			c.String(http.StatusServiceUnavailable, "redis unreachable")
-			return
-		}
-		c.Status(http.StatusOK)
-	})
-
 	orderRepo := postgres.NewOrderRepository(appCtx.DB)
 	orderService := services.NewOrderService(orderRepo)
 	orderHandler := handlers.NewOrderHandler(orderService)
-	orderHandler.Register(engine)
+
+	routers.Register(engine, appCtx, orderHandler)
 
 	return &ServerDependencies{App: appCtx, Engine: engine}
 }

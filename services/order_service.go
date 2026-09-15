@@ -23,3 +23,7 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID string, totalCent
 	}
 	return o, nil
 }
+
+func (s *OrderService) GetOrder(ctx context.Context, id string) (*order.Order, error) {
+	return s.repo.GetByID(ctx, id)
+}
