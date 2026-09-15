@@ -35,7 +35,8 @@ func NewServerDependencies(appCtx *app.AppContext) *ServerDependencies {
 	})
 
 	orderRepo := postgres.NewOrderRepository(appCtx.DB)
-	orderService := services.NewOrderService(orderRepo)
+	userRepo := postgres.NewUserRepository(appCtx.DB)
+	orderService := services.NewOrderService(orderRepo, userRepo)
 	orderHandler := handlers.NewOrderHandler(orderService)
 	orderHandler.Register(engine)
 

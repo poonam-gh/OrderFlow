@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -30,6 +31,10 @@ func (h *OrderHandler) Create(c *gin.Context) {
 
 	o, err := h.service.CreateOrder(c.Request.Context(), req.UserID, req.TotalCents)
 	if err != nil {
+		if errors.Is(err, services.ErrUserNotFound) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "user does not exist"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
