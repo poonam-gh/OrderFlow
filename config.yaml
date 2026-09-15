@@ -3,7 +3,7 @@ server:
 
 postgres:
   host: localhost
-  port: 5433
+  port: 5434
   user: orderflow
   password: orderflow
   dbname: orderflow
