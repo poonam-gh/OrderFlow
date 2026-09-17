@@ -1,3 +1,4 @@
+//go:generate mockgen -source=payment_gateway.go -destination=mocks/mock_payment_gateway.go -package=mocks
 package contracts
 
 import "context"

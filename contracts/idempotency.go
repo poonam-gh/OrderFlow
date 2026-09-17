@@ -1,3 +1,4 @@
+//go:generate mockgen -source=idempotency.go -destination=mocks/mock_idempotency.go -package=mocks
 package contracts
 
 import "context"

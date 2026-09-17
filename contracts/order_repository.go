@@ -1,3 +1,4 @@
+//go:generate mockgen -source=order_repository.go -destination=mocks/mock_order_repository.go -package=mocks
 package contracts
 
 import (

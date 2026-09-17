@@ -1,3 +1,4 @@
+//go:generate mockgen -source=cache.go -destination=mocks/mock_cache.go -package=mocks
 package contracts
 
 import (

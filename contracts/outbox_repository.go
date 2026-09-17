@@ -1,3 +1,4 @@
+//go:generate mockgen -source=outbox_repository.go -destination=mocks/mock_outbox_repository.go -package=mocks
 package contracts
 
 import "context"
