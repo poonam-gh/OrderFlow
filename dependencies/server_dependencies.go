@@ -10,6 +10,7 @@ import (
 	"orderflow/app"
 	"orderflow/handlers"
 	"orderflow/infra/postgres"
+	orderflowredis "orderflow/infra/redis"
 	"orderflow/routers"
 	"orderflow/services"
 )
@@ -25,9 +26,20 @@ func NewServerDependencies(appCtx *app.AppContext) *ServerDependencies {
 
 	orderRepo := postgres.NewOrderRepository(appCtx.DB)
 	orderService := services.NewOrderService(orderRepo)
-	orderHandler := handlers.NewOrderHandler(orderService)
+	idempotencyStore := orderflowredis.NewIdempotencyStore(appCtx.Redis, time.Duration(appCtx.Config.Idempotency.TTLHours)*time.Hour)
+	orderHandler := handlers.NewOrderHandler(orderService, idempotencyStore)
 
-	routers.Register(engine, appCtx, orderHandler)
+	productRepo := postgres.NewProductRepository(appCtx.DB)
+	productCache := orderflowredis.NewProductCache(appCtx.Redis, time.Duration(appCtx.Config.ProductCache.TTLSeconds)*time.Second)
+	productService := services.NewProductService(productRepo, productCache)
+	productHandler := handlers.NewProductHandler(productService)
+
+	userRepo := postgres.NewUserRepository(appCtx.DB)
+	tokenTTL := time.Duration(appCtx.Config.Auth.TokenTTLMinutes) * time.Minute
+	userService := services.NewUserService(userRepo, appCtx.Config.Auth.JWTSecret, tokenTTL)
+	userHandler := handlers.NewUserHandler(userService)
+
+	routers.Register(engine, appCtx, orderHandler, productHandler, userHandler)
 
 	return &ServerDependencies{App: appCtx, Engine: engine}
 }

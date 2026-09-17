@@ -7,6 +7,8 @@ import (
 )
 
 type OrderRepository interface {
-	Create(ctx context.Context, o *order.Order) error
+	CreateWithItems(ctx context.Context, o *order.Order, items []order.ItemInput) error
 	GetByID(ctx context.Context, id string) (*order.Order, error)
+	ListByUser(ctx context.Context, userID string, limit, offset int) ([]order.Order, error)
+	UpdateStatus(ctx context.Context, id string, status string) error
 }

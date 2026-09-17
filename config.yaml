@@ -14,3 +14,32 @@ redis:
 
 worker:
   count: 4
+
+auth:
+  jwt_secret: "dev-secret-change-me"
+  token_ttl_minutes: 60
+
+payment:
+  failure_rate: 0.3
+  latency_ms: 50
+
+circuit_breaker:
+  failure_threshold: 3
+  reset_timeout_seconds: 5
+
+outbox:
+  poll_interval_seconds: 2
+  batch_size: 10
+
+rate_limit:
+  requests: 20
+  window_seconds: 60
+
+product_cache:
+  ttl_seconds: 30
+
+metrics:
+  worker_port: 9091
+
+idempotency:
+  ttl_hours: 24

@@ -12,6 +12,7 @@ import (
 	"orderflow/config"
 	"orderflow/infra/postgres"
 	redisinfra "orderflow/infra/redis"
+	"orderflow/pkg/logger"
 )
 
 // AppContext holds the dependencies every entrypoint needs: config, logger, DB, Redis.
@@ -28,7 +29,7 @@ func NewAppContext(ctx context.Context, configPath string) (*AppContext, error) 
 		return nil, fmt.Errorf("load config: %w", err)
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log := logger.New(os.Stdout)
 
 	pool, err := postgres.NewPool(ctx, cfg.PostgresDSN())
 	if err != nil {
@@ -43,7 +44,7 @@ func NewAppContext(ctx context.Context, configPath string) (*AppContext, error) 
 
 	return &AppContext{
 		Config: cfg,
-		Logger: logger,
+		Logger: log,
 		DB:     pool,
 		Redis:  rdb,
 	}, nil

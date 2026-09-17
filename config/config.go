@@ -28,6 +28,43 @@ type Config struct {
 	Worker struct {
 		Count int `yaml:"count"`
 	} `yaml:"worker"`
+
+	Auth struct {
+		JWTSecret       string `yaml:"jwt_secret"`
+		TokenTTLMinutes int    `yaml:"token_ttl_minutes"`
+	} `yaml:"auth"`
+
+	Payment struct {
+		FailureRate float64 `yaml:"failure_rate"`
+		LatencyMs   int     `yaml:"latency_ms"`
+	} `yaml:"payment"`
+
+	CircuitBreaker struct {
+		FailureThreshold    int `yaml:"failure_threshold"`
+		ResetTimeoutSeconds int `yaml:"reset_timeout_seconds"`
+	} `yaml:"circuit_breaker"`
+
+	Outbox struct {
+		PollIntervalSeconds int `yaml:"poll_interval_seconds"`
+		BatchSize           int `yaml:"batch_size"`
+	} `yaml:"outbox"`
+
+	RateLimit struct {
+		Requests      int `yaml:"requests"`
+		WindowSeconds int `yaml:"window_seconds"`
+	} `yaml:"rate_limit"`
+
+	ProductCache struct {
+		TTLSeconds int `yaml:"ttl_seconds"`
+	} `yaml:"product_cache"`
+
+	Metrics struct {
+		WorkerPort int `yaml:"worker_port"`
+	} `yaml:"metrics"`
+
+	Idempotency struct {
+		TTLHours int `yaml:"ttl_hours"`
+	} `yaml:"idempotency"`
 }
 
 func Load(path string) (*Config, error) {

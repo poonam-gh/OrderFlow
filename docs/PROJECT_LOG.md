@@ -900,31 +900,353 @@ id → 200 with the row, fetch by a nonexistent id → 404
 
 ---
 
+## 17. Completing the project: every remaining piece, wired and tested live
+
+Everything from here on was built in one pass to bring the project to the
+full architecture described at the top of this log — Users (JWT + RBAC),
+Products (stock + cache-aside), real order validation, the outbox write,
+the outbox dispatcher actually driving the worker pool, the hand-rolled
+circuit breaker in production use, a mock payment gateway, notifications,
+Redis rate limiting, and Prometheus metrics on **both** processes. Then all
+of it was actually run and exercised end-to-end against the live
+Postgres/Redis — not just compiled.
+
+### Users domain (JWT auth + RBAC)
+
+`domains/user`, `contracts/user_repository.go`, `infra/postgres/user_repo.go`,
+`services/user_service.go`, `handlers/user_handler.go`,
+`routers/user_routes.go` — `POST /users/register` (bcrypt-hashes the
+password, `user.ErrEmailTaken` on a duplicate email via detecting Postgres
+error code `23505`) and `POST /users/login` (verifies via
+`bcrypt.CompareHashAndPassword`, returns a signed HS256 JWT with the user's
+id as `sub` and role as a custom claim, `config.yaml`'s `auth.jwt_secret` /
+`auth.token_ttl_minutes`).
+
+`routers/middleware/auth.go` — `AuthRequired(secret)` parses `Authorization:
+Bearer <token>`, validates it, and puts `user_id`/`role` into the gin
+context; `RequireRole(role)` gates admin-only routes. **`POST /orders` now
+reads `user_id` from the validated JWT, not the request body** — this
+closes the earlier testing gap (section 15) where any client-supplied
+`user_id` was trusted; now an order can never be created for someone else,
+and the FK to `users` is guaranteed satisfied by construction.
+
+Known simplification: there's no admin-bootstrap flow — the first admin
+user's role has to be promoted directly in Postgres (`UPDATE users SET
+role='admin' ...`). Fine for a learning project, not something to ship.
+
+### Products domain (stock + Redis cache-aside)
+
+`domains/product`, `contracts/product_repository.go`,
+`infra/postgres/product_repo.go`, `services/product_service.go`,
+`handlers/product_handler.go`, `routers/product_routes.go` — `GET
+/products/:id` is public; `POST /products` requires `AuthRequired` +
+`RequireRole("admin")`.
+
+`contracts/cache.go` defines `ProductCache` (cache-aside: a miss means "go
+to Postgres," the cache is never authoritative); `infra/redis/product_cache.go`
+implements it with a plain `GET`/`SET` + TTL (`product_cache.ttl_seconds`).
+`ProductService.GetProduct` checks the cache first, falls back to the
+repository on a miss, then populates the cache — this is exactly the
+pattern described back in section 4, now real: verified live by reading
+`product:<id>` straight out of Redis with `redis-cli GET` right after a
+`GET /products/:id` call and seeing the exact row.
+
+### Order validation + the outbox write, for real this time
+
+`domains/order` grew `Item`/`ItemInput` and three new sentinel errors:
+`ErrEmptyItems`, `ErrProductNotFound`, `ErrInsufficientStock`.
+`contracts/order_repository.go`'s `Create` became `CreateWithItems(ctx, o,
+items)`, plus `UpdateStatus`. The real logic lives in
+`infra/postgres/order_repo.go`, all inside **one transaction**:
+
+1. For each item, `SELECT price_cents, stock FROM products WHERE id = $1
+   FOR UPDATE` — locks the row so concurrent orders for the same product
+   can't both read stale stock and both succeed.
+2. No such product → `order.ErrProductNotFound`. `stock < quantity` →
+   `order.ErrInsufficientStock` (transaction rolls back via `defer
+   tx.Rollback()`, which is a safe no-op after a successful `Commit`).
+3. Decrement stock, accumulate `total_cents` server-side from the actual
+   product prices (never trust a client-supplied total).
+4. Insert the order, insert each `order_items` row, insert the
+   `outbox_events` row (`event_type: "order.created"`, payload
+   `{order_id, total_cents}`) — then `tx.Commit()`.
+
+This is the outbox pattern finally made real: the order and its outbox
+event either both commit or neither does. `handlers/order_handler.go` maps
+`ErrProductNotFound` → 404, `ErrInsufficientStock`/`ErrEmptyItems` → 409.
+Gin's built-in struct-tag validation (`binding:"required,min=1,dive"` etc.,
+already part of gin via `go-playground/validator` — no new dependency)
+handles shape validation (empty body, non-positive quantity) before the
+service is even called.
+
+**Verified live:** ordering more than available stock → `409`, ordering a
+nonexistent product → `404`, an empty `items` array → `400` from gin's
+binding — and in every failure case, `SELECT stock FROM products` showed
+the stock **unchanged**, proving the transaction actually rolled back
+rather than partially applying.
+
+### The hand-rolled circuit breaker, in real use
+
+`pkg/circuitbreaker/breaker.go` (built earlier, section — see the file
+itself) is now actually wired into `services/payment_service.go`, wrapping
+calls to `infra/payment/mock_gateway.go` — a fake gateway with a
+configurable failure rate and latency (`payment.failure_rate`,
+`payment.latency_ms`), simulating exactly the kind of flaky external
+dependency a circuit breaker exists for. `PaymentService.ProcessPayment`
+runs the charge through `breaker.Execute`, then **always** records the
+payment attempt and updates the order status (`paid`/`payment_failed`)
+regardless of whether the charge succeeded — persistence happens before
+the error is returned to the caller.
+
+**Verified live, not just unit-tested:** cranked `payment.failure_rate` to
+`1.0`, restarted the worker, fired 3 orders → all 3 failed →
+`circuit_breaker_state{name="payment_gateway"}` flipped from `0` to `1`
+(Open) exactly on the 3rd consecutive failure (`circuit_breaker.
+failure_threshold: 3`). A 4th order arrived ~26s later (past
+`reset_timeout_seconds: 5`) and the breaker had already gone half-open,
+let the trial through, watched it fail, and reopened — the same
+`TestBreakerHalfOpenFailureReopens` behavior from the unit test, now
+observed in a live process. Restored `failure_rate` to `0.3` and confirmed
+the gauge dropped back to `0` (Closed) — the breaker resets its
+consecutive-failure count on *any* success, so a realistic mixed
+success/failure rate never trips it, only a run of consecutive failures
+does.
+
+### The outbox dispatcher — what finally gives the worker pool something to do
+
+New package `outbox/dispatcher.go`: depends only on
+`contracts.OutboxRepository` and `*worker.Pool` — same "no business
+knowledge" discipline as `worker/` itself (section 6). `Run` ticks every
+`outbox.poll_interval_seconds` and calls `Claim`, which lives in
+`infra/postgres/outbox_repo.go`:
+
+```sql
+WITH claimed AS (
+    SELECT id FROM outbox_events
+    WHERE status = 'pending'
+    ORDER BY created_at
+    LIMIT $1
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE outbox_events SET status = 'processing'
+WHERE id IN (SELECT id FROM claimed)
+RETURNING id, event_type, payload
+```
+
+One statement atomically claims a batch *and* flips it to `processing` —
+no transaction needs to stay open while the (potentially slow, external)
+processing happens afterward. `FOR UPDATE SKIP LOCKED` means if this
+project ever runs multiple worker instances, they'd claim disjoint batches
+without blocking each other — which is also why the originally-planned
+separate Redis distributed lock for this turned out to be unnecessary: the
+SKIP LOCKED claim already solves the exact problem it would have solved,
+and adding both would have been redundant complexity for no extra
+correctness. (Redis still earns its keep elsewhere — rate limiting and
+product caching, both genuinely using Redis's atomicity/TTL properties.)
+
+Each claimed event becomes a `worker.Job` submitted to the pool.
+`dependencies/worker_dependencies.go` registers the actual business logic
+for `"order.created"` on the delegator: unmarshal the payload, call
+`PaymentService.ProcessPayment`, call `NotificationService.Notify`, record
+the circuit breaker's state and an outbox-processed counter as metrics,
+then `MarkProcessed`/`MarkFailed` on the outbox row. `WorkerDependencies.Run`
+now starts the pool, the dispatcher, *and* a metrics server (below)
+concurrently via a `sync.WaitGroup`, all three shut down together on
+context cancellation.
+
+**Verified live end-to-end:** created an order → within one poll interval
+the worker log showed `"notification sent"` → order status flipped to
+`paid` in Postgres → a `payments` row appeared → product stock decremented
+→ the `outbox_events` row showed `status: processed`. The entire chain
+from section 15's original diagram, actually working, for the first time.
+
+### A real bug found while testing: metrics split across two processes
+
+`/metrics` was registered on the **server**'s gin engine, but
+`circuit_breaker_state` and `outbox_events_processed_total` are only ever
+updated inside the **worker** process — and Prometheus's default registry
+is in-memory and per-process. Two separate `go run` processes have two
+separate memories, so the worker's metrics were completely invisible on
+the server's `/metrics`, silently. Caught by actually curling `/metrics`
+after a processed order and finding the counters simply absent rather than
+zero.
+
+**Fix:** the worker now runs its own tiny `/metrics` HTTP server
+(`metrics.worker_port`, default `9091`) via `promhttp.Handler()`, started
+and shut down alongside the pool and dispatcher in
+`WorkerDependencies.Run`. This is also just... correct architecture: a
+horizontally-scaled worker fleet needs each instance scraped
+independently anyway, the same way a real deployment would point
+Prometheus at multiple worker pods, not just the API server.
+
+### Redis rate limiting
+
+`infra/redis/ratelimiter.go` — a fixed-window counter (`INCR` + `EXPIRE`
+on first hit), atomic by construction since Redis executes `INCR` on its
+single command thread — no separate GET-then-SET race is possible the way
+there would be in application code. `routers/middleware/ratelimit.go`
+applies it globally (`engine.Use(...)`, keyed by client IP) — fails *open*
+on a Redis error (an infra hiccup shouldn't take the whole API down).
+
+**Verified live:** looped `/healthz` past the configured limit (`rate_limit.
+requests: 20` per `rate_limit.window_seconds: 60`) and got `429`s exactly
+as expected — and confirmed the limit is global per IP across *every*
+route, not per-endpoint, since it's one `engine.Use()` middleware, not a
+per-route one. A simplification worth naming: this is a fixed window, not
+a sliding window — simpler and still correct/atomic, but it allows a burst
+of up to 2x the limit right at a window boundary. A sliding-window
+sorted-set implementation would close that gap; not worth the extra
+complexity here.
+
+### Prometheus metrics
+
+`pkg/metrics/metrics.go` — `http_request_duration_seconds` (histogram, by
+method/path/status), `circuit_breaker_state` (gauge), `outbox_events_
+processed_total` (counter, by event type and result).
+`routers/middleware/metrics.go` records every HTTP request's duration on
+the server; the worker records the other two (see above). Verified live:
+`/metrics` on the server showed a distinct counter per route+status
+combination actually hit during testing (`POST /orders` with `201`, `404`,
+`409`, `400` all present as separate series).
+
+### Verification summary (all run against the live containers, not mocked)
+
+- Register → duplicate email → 409. Login → wrong password → 401.
+- Customer tries `POST /products` → 403. No token → 401. Admin → 201.
+- `GET /products/:id` twice → second read confirmed served from Redis
+  (`redis-cli GET product:<id>` returned the exact cached row).
+- Full order → outbox → worker → payment → notification chain, confirmed
+  in Postgres at every step (order status, payment row, stock, outbox row).
+- Insufficient stock / missing product / empty items → 409/404/400, stock
+  provably unchanged after each rejected attempt.
+- Circuit breaker: forced open at 3 consecutive failures, watched a
+  half-open trial fail and reopen it, watched it return to closed once
+  failures stopped being consecutive — all via the live `/metrics` gauge.
+- Rate limiter: tripped at the configured threshold, globally per IP.
+- `audit_log` row counts confirmed independent triggers fired on `orders`,
+  `products`, and `payments` throughout the entire session (11 inserts + 8
+  updates on `orders`, 8 inserts on `payments`, 1 insert + 8 updates on
+  `products` — matching every write made during testing).
+- `go build ./...`, `go vet ./...`, `gofmt -l .`, and `go test ./...`
+  (circuit breaker unit tests) all clean at the end.
+
+---
+
+## 18. Closing the known gaps: ownership, request tracing, lists, idempotency
+
+After section 17 the project was feature-complete but had a few named
+gaps. This pass closed three of them (ownership, request tracing, list
+endpoints + idempotency) and deliberately left the rest (Dockerfile/CI)
+for later.
+
+### Order ownership check
+
+`domains/order` gained `ErrForbidden`. `OrderService.GetOrder(ctx, id,
+requesterID string, isAdmin bool)` now fetches the order, then returns
+`ErrForbidden` unless `isAdmin` or `o.UserID == requesterID`.
+`handlers/order_handler.go`'s `Get` reads `user_id`/`role` from the gin
+context (set by `AuthRequired`) and maps `ErrForbidden` → `403`. Admins
+bypass the check entirely — a real support/ops use case (looking up a
+customer's order), not just a technicality.
+
+**Verified live:** a second registered user got `403 {"error":"order does
+not belong to this user"}` fetching the first user's order; the owner got
+`200`; the admin token got `200` for the same order.
+
+### Request-id / correlation-id, propagated across processes
+
+New `pkg/requestid` (generate/attach/read an ID on a `context.Context`)
+and `pkg/logger` (the JSON `slog` constructor, now used by `AppContext`
+instead of being inlined there, plus `logger.Ctx(ctx, base)` which adds a
+`request_id` attribute to log lines if the context carries one).
+`routers/middleware/requestid.go` reads an incoming `X-Request-ID` header
+or generates one, puts it on the request's `context.Context` (so it flows
+through handler → service → repository automatically — no signature
+changes needed anywhere in that chain), and echoes it on the response.
+Registered first in the middleware chain, before metrics/rate-limit.
+
+The interesting part is making this survive the jump from the **server**
+process to the **worker** process, which don't share memory or a request:
+`infra/postgres/order_repo.go`'s `CreateWithItems` reads the request id off
+`ctx` and includes it in the `"order.created"` outbox payload
+(`{order_id, total_cents, request_id}`). `dependencies/worker_dependencies.go`'s
+`handleOrderCreated` reads it back out of the payload and re-attaches it to
+the job's `context.Context` via `requestid.WithID`, so every log line from
+that point on (`PaymentService`, `NotificationService`) carries the same
+`request_id` the original HTTP client saw in its response header.
+
+**Verified live:** `curl -D -` on `/healthz` showed a generated
+`X-Request-Id` header; sending one explicitly (`X-Request-ID:
+my-custom-id-123`) got it echoed back unchanged; creating an order and
+then grepping the worker's log for `request_id` showed the notification
+log line carrying that same value. One request, traced across two OS
+processes.
+
+Named gap: gin's own built-in access-log line (`[GIN] ... 200 ... /orders`)
+doesn't include the request id inline — only the explicit `slog` lines do.
+Good enough to trace a specific request through business logic; not yet a
+fully unified access log.
+
+### List endpoints
+
+`contracts.OrderRepository` gained `ListByUser(ctx, userID, limit,
+offset)`; `contracts.ProductRepository` gained `List(ctx, limit, offset)`.
+`GET /orders` (authenticated — lists **the caller's own** orders only,
+consistent with the ownership work above, not a global list) and `GET
+/products` (public) both take `?limit=&offset=` query params, clamped in
+`handlers.paginationParams` (default 20, max 100, offset ≥ 0) — a shared
+helper function in the `handlers` package used by both handlers, no need
+to duplicate it per-domain.
+
+### Idempotency-Key on `POST /orders`
+
+`contracts.IdempotencyStore` (interface) + `infra/redis/idempotency.go`
+(implementation): `Claim` atomically reserves a client-supplied
+`Idempotency-Key` via Redis `SETNX` — the same atomicity property that
+made the rate limiter and distributed-lock discussions correct earlier
+(section 4) — storing a `"processing"` placeholder. If the key is new,
+the caller proceeds to create the order normally, then calls `Resolve` to
+overwrite the placeholder with the real order id. If the key already
+exists: still `"processing"` → `409` ("already in progress"); already
+resolved to an order id → that order is fetched and replayed as `200`
+instead of creating a duplicate.
+
+`OrderHandler.Create` wires this in via `replayIfClaimed`, which returns
+`done=true` once it has fully handled the response itself (either a
+replay or a conflict), so `Create` just returns early rather than falling
+through to actually create anything. A Redis error during the check fails
+*open* — proceeds as a non-idempotent request rather than blocking order
+creation over an infra hiccup.
+
+**Verified live:** two identical `POST /orders` calls with the same
+`Idempotency-Key` — first returned `201` with a new order, second returned
+`200` with the **exact same order id**, and — the real proof — product
+stock was decremented exactly once, not twice.
+
+---
+
 ## Status as of this writing
 
-Done: project skeleton, config loading, Postgres (via sqlx)/Redis
-connections, `AppContext`, `ServerDependencies`/`WorkerDependencies`, the
-generic worker pool + service delegator, the cobra CLI
-(`server`/`worker`/`migrate`), and the full migration set (schema + outbox
-+ audit triggers). Postgres and Redis are now actually running locally via
-`podman-compose` (Postgres on host port `5433`, see section 14), all
-migrations are applied and verified directly in `psql`, and both
-`orderflow server` (`/healthz` → 200, pinging both dependencies) and
-`orderflow worker` (worker pool starts, 4 goroutines) have been run
-end-to-end successfully.
+The project is feature-complete against the architecture described at the
+top of this log, plus the hardening from this section: Users (JWT +
+RBAC), Products (stock + cache-aside), Orders (validated, transactional,
+outbox-backed, ownership-checked, idempotent), a hand-rolled circuit
+breaker protecting a mock payment gateway, a worker pool driven by a real
+outbox dispatcher, notifications, Redis-backed rate limiting, Prometheus
+metrics on both the server and worker processes, and request-id tracing
+that survives the jump from the API process to the worker process. Every
+piece has been exercised live against the actual running Postgres/Redis
+containers, not just compiled — see sections 17–18 for the full
+verification trail.
 
-Two real endpoints now exist: `POST /orders` and `GET /orders/:id`
-(sections 15–16) — no validation, no outbox event, no worker involvement
-yet, just request → Postgres → response. Routing is now properly owned by
-`routers/` (per-resource route files, e.g. `order_routes.go`), separate
-from `handlers/`, which only handles requests. Verified end-to-end
-including the audit trigger firing on real traffic and a proper 404 on a
-missing order.
-
-Not yet done: Products/Users/Payments domains are still empty
-(`contracts/`, `domains/`, `handlers/`, `routers/` only have Order-related
-files so far; `views/` is still unused). No stock validation, no outbox
-event written on order creation yet, and the worker pool/delegator still
-have nothing registered — the worker process currently just idles. Next
-up: add validation + the outbox write to `CreateOrder`, then build the
-outbox dispatcher that actually gives the worker pool something to do.
+Known gaps, all deliberate and named rather than accidental: no
+admin-bootstrap flow (role promotion is a manual `psql` update), no
+integration test suite (only the circuit breaker has unit tests — the rest
+was verified manually via `curl`/`psql`), rate limiting is fixed-window
+rather than sliding-window, no retry/dead-letter path for a failed outbox
+event (`MarkFailed` is terminal), gin's own access-log line doesn't carry
+the request id inline, and no `Dockerfile`/CI workflow for the app itself
+yet (deliberately deferred, not forgotten). `views/` remains unused —
+every domain's JSON response is still its DB-row struct directly;
+introducing a separate response DTO layer would be the next cleanup if the
+API's public shape ever needs to diverge from its storage shape.
